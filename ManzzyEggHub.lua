@@ -139,13 +139,16 @@ end
       biar keyword CONFIG di bawah bisa di-tuning.
 ]]
 
+local SCRIPT_VERSION = "2.0.0-macro"
+local VERSION_URL = "https://raw.githubusercontent.com/ManzzyGacor/egg/main/VERSION"
+
 -- ============================= CONFIG =============================
 local CONFIG = {
     -- Fitur inti AFK
     AntiAFK        = true,   -- blok kick AFK 20 menit dari Roblox
-    AntiKick       = true,   -- blok :Kick() client-side (butuh executor yg support)
-    AutoUnstuck    = true,   -- lompat + nudge kalau nyangkut
-    AutoRejoin     = true,   -- rejoin kalau karakter/state rusak atau nyangkut parah
+    AntiKick       = true,   -- blok :Kick() client-side; ini yang nahan kick blacklist BAC-xxxx
+    AutoUnstuck    = true,   -- lompat kalau nyangkut (macro mode: tanpa teleport)
+    AutoRejoin     = false,  -- OFF: habis ke-kick anticheat, auto-rejoin = loop kick->ban
 
     -- Farming
     AutoFarm       = false,  -- cari & ambil egg otomatis
@@ -158,6 +161,15 @@ local CONFIG = {
     TreadmillKeywords = {"treadmill", "training"},
     PromptKeywords    = {"steal", "grab", "take", "collect", "claim", "hatch", "place", "pick"},
     IgnoreKeywords    = {"fake", "decoy", "troll", "trap", "shop", "buy", "sell", "sign"},
+
+    -- MACRO MODE (default ON) — simulasi input manusia, bukan panggilan API langsung.
+    -- Ini yang bikin jejaknya lebih kecil, BUKAN bypass anticheat.
+    MacroMode          = true,
+    MacroMinDelay      = 0.35,  -- jeda minimum antar aksi (detik)
+    MacroMaxDelay      = 1.15,  -- jeda maksimum antar aksi
+    MacroMaxFirePerMin = 25,    -- batas prompt-fire per menit
+    MacroKeyHoldMin    = 0.06,  -- durasi tahan tombol minimum
+    MacroKeyHoldMax    = 0.16,  -- durasi tahan tombol maksimum
 
     -- Angka-angka
     MaxFarmDistance  = 800,  -- studs; egg lebih jauh dari ini diabaikan
@@ -329,29 +341,66 @@ local function rejoin(reason)
 end
 
 -- ============================= PROMPT =============================
+-- rate limiter: manusia nggak bisa nekan E 200x per menit
+local fireTimes = {}
+local function fireRateBlocked()
+    if not CONFIG.MacroMode then return false end
+    local now = os.clock()
+    local kept, n = {}, 0
+    for _, t in ipairs(fireTimes) do
+        if now - t < 60 then
+            n = n + 1
+            table.insert(kept, t)
+        end
+    end
+    fireTimes = kept
+    return n >= CONFIG.MacroMaxFirePerMin
+end
+
+local function macroWait(minD, maxD)
+    task.wait(math.random() * (maxD - minD) + minD)
+end
+
 local function firePrompt(prompt)
     if not prompt or not prompt.Parent then return false end
     pcall(function() prompt.HoldDuration = 0 end)
 
     local fired = false
-    if type(fireproximityprompt) == "function" then
-        fired = pcall(fireproximityprompt, prompt)
-    end
-    if not fired then
-        -- fallback: simulasi tombol lewat VirtualInputManager (nggak semua executor punya)
+    if CONFIG.MacroMode then
+        -- MACRO: kirim event tombol kayak manusia yang nekan E.
+        -- fireproximityprompt sengaja di-skip: itu panggilan executor
+        -- langsung ke fungsi game, dan itu sinyal termurah buat di-flag.
         local okVim, vim = pcall(function() return game:GetService("VirtualInputManager") end)
         if okVim and vim then
             local kc = prompt.KeyboardKeyCode or Enum.KeyCode.E
-            pcall(function()
-                vim:SendKeyEvent(true, kc, false, game)
-                vim:SendKeyEvent(false, kc, false, game)
-            end)
+            pcall(function() vim:SendKeyEvent(true, kc, false, game) end)
+            macroWait(CONFIG.MacroKeyHoldMin, CONFIG.MacroKeyHoldMax)
+            pcall(function() vim:SendKeyEvent(false, kc, false, game) end)
             fired = true
+        elseif type(fireproximityprompt) == "function" then
+            -- executor nggak punya VirtualInputManager -> last resort
+            fired = pcall(fireproximityprompt, prompt)
+        end
+    else
+        if type(fireproximityprompt) == "function" then
+            fired = pcall(fireproximityprompt, prompt)
+        end
+        if not fired then
+            local okVim, vim = pcall(function() return game:GetService("VirtualInputManager") end)
+            if okVim and vim then
+                local kc = prompt.KeyboardKeyCode or Enum.KeyCode.E
+                pcall(function()
+                    vim:SendKeyEvent(true, kc, false, game)
+                    vim:SendKeyEvent(false, kc, false, game)
+                end)
+                fired = true
+            end
         end
     end
 
     if fired then
         state.promptsFired = state.promptsFired + 1
+        table.insert(fireTimes, os.clock())
         local txt = lower(prompt.ActionText) .. "|" .. lower(prompt.ObjectText) .. "|"
             .. lower(prompt.Name) .. "|" .. lower(prompt.Parent and prompt.Parent.Name)
         state.lastAction = "prompt: " .. tostring(prompt.ActionText or prompt.Name)
@@ -383,9 +432,39 @@ local function refreshPromptCache()
     state.promptCache = list
 end
 
+-- Update check: DATA ONLY. Ambil string versi, bandingkan. Nggak pernah
+-- execute kode dari internet — auto-update yang load+run remote code itu
+-- jalur masuk malware, apalagi kalau repo-nya bisa di-push orang lain.
+local function checkUpdate()
+    state.lastAction = "cek update..."
+    local ok, body = pcall(function() return game:HttpGet(VERSION_URL, true) end)
+    if not ok or type(body) ~= "string" then
+        state.lastAction = "cek update gagal (offline/diblokir)"
+        warn("[EGG HUB] update check gagal:", body)
+        return
+    end
+    local remoteVer = string.match(body, "^%s*([%w%.%-]+)")
+    if not remoteVer then
+        state.lastAction = "VERSION file formatnya aneh"
+        return
+    end
+    if remoteVer == SCRIPT_VERSION then
+        state.lastAction = "up to date (v" .. SCRIPT_VERSION .. ")"
+        print("[EGG HUB] up to date: v" .. SCRIPT_VERSION)
+    else
+        state.lastAction = "UPDATE ADA: v" .. remoteVer .. " (lu: v" .. SCRIPT_VERSION .. ")"
+        warn("[EGG HUB] versi baru di repo: v" .. remoteVer .. " — lu pakai v" .. SCRIPT_VERSION
+            .. ". Download ulang ManzzyEggHub.lua, BACA diff-nya, baru execute.")
+    end
+end
+
 local function processPrompts(radiusOverride)
     -- auto-fire prompt yang cocok keyword di sekitar player
     if not CONFIG.AutoPrompt then return end
+    if fireRateBlocked() then
+        state.lastAction = "rate limit — nunggu cooldown macro"
+        return
+    end
     local char, root = getChar()
     if not root then return end
     refreshPromptCache()
@@ -399,16 +478,23 @@ local function processPrompts(radiusOverride)
                     pos = holder.WorldPosition
                 end
                 if pos then
-                    local maxD = radiusOverride or ((prompt.MaxActivationDistance or 10) + 3)
+                    local baseD = prompt.MaxActivationDistance or 10
+                    -- macro mode: jangan pernah fire dari luar jangkauan prompt.
+                    -- Fire dari jarak jauh itu bukti paling jelas bukan manusia.
+                    local maxD = CONFIG.MacroMode and baseD or (radiusOverride or (baseD + 3))
                     if (root.Position - pos).Magnitude <= maxD then
                         local txt = lower(prompt.ActionText) .. "|" .. lower(prompt.ObjectText)
                             .. "|" .. lower(holder.Name) .. "|" .. lower(prompt.Name)
                         if not matches(txt, CONFIG.IgnoreKeywords)
                             and containsAny(txt, CONFIG.PromptKeywords) then
                             local last = state.promptLastFire[prompt] or 0
-                            if now - last > 2 then
+                            local gap = CONFIG.MacroMode and (2 + math.random() * 2.5) or 2
+                            if now - last > gap then
                                 state.promptLastFire[prompt] = now
                                 firePrompt(prompt)
+                                if CONFIG.MacroMode then
+                                    macroWait(CONFIG.MacroMinDelay, CONFIG.MacroMaxDelay)
+                                end
                             end
                         end
                     end
@@ -691,7 +777,11 @@ local function brain()
                 end
             end
         end)
-        task.wait(0.75)
+        if CONFIG.MacroMode then
+            macroWait(CONFIG.MacroMinDelay + 0.4, CONFIG.MacroMaxDelay + 0.4)
+        else
+            task.wait(0.75)
+        end
     end
 end
 
@@ -711,9 +801,15 @@ local function unstuckLoop()
                         hum:ChangeState(Enum.HumanoidStateType.Jumping)
                         local dir = Vector3.new(math.random() - 0.5, 0, math.random() - 0.5)
                         if dir.Magnitude > 0.01 then
-                            pcall(function()
-                                root.CFrame = root.CFrame * CFrame.new(dir.Unit * 15)
-                            end)
+                            if CONFIG.MacroMode then
+                                -- MACRO: jalan biasa ke titik acak. TANPA nulis CFrame —
+                                -- lompat 15 studs sekali frame itu signature teleport.
+                                hum:MoveTo(root.Position + dir.Unit * 12)
+                            else
+                                pcall(function()
+                                    root.CFrame = root.CFrame * CFrame.new(dir.Unit * 15)
+                                end)
+                            end
                         end
                         state.lastAction = "unstuck #" .. state.stuckCount
                         if state.stuckCount >= 4 and CONFIG.AutoRejoin then
@@ -797,8 +893,8 @@ local function buildGui()
 
     local win = Instance.new("Frame")
     win.Parent = gui
-    win.Size = UDim2.new(0, 290, 0, 380)
-    win.Position = UDim2.new(0.5, -145, 0.5, -190)
+    win.Size = UDim2.new(0, 290, 0, 442)
+    win.Position = UDim2.new(0.5, -145, 0.5, -221)
     win.BackgroundColor3 = Color3.fromRGB(22, 22, 30)
     win.BorderSizePixel = 0
     local winCorner = Instance.new("UICorner")
@@ -852,7 +948,7 @@ local function buildGui()
 
     minBtn.MouseButton1Click:Connect(function()
         body.Visible = not body.Visible
-        win.Size = body.Visible and UDim2.new(0, 290, 0, 380) or UDim2.new(0, 290, 0, 34)
+        win.Size = body.Visible and UDim2.new(0, 290, 0, 442) or UDim2.new(0, 290, 0, 34)
     end)
 
     -- draggable
@@ -883,6 +979,7 @@ local function buildGui()
     local rows = {
         {"Anti AFK",        "AntiAFK"},
         {"Anti Kick",       "AntiKick"},
+        {"Macro Mode 🐢",   "MacroMode"},
         {"Auto Farm Egg",   "AutoFarm"},
         {"Auto Return",     "AutoReturn"},
         {"Auto Prompt",     "AutoPrompt"},
@@ -943,6 +1040,7 @@ local function buildGui()
     local actions = {
         {"SET BASE 📍",  setBaseHere},
         {"DEBUG DUMP",   debugDump},
+        {"CHECK UPDATE", checkUpdate},
         {"REJOIN 🔄",    function() rejoin("manual") end},
         {"UNLOAD ✖",     function() unload() end},
     }
@@ -966,7 +1064,7 @@ local function buildGui()
         bc2.Parent = btn
         btn.MouseButton1Click:Connect(act[2])
     end
-    y = y + 56
+    y = y + 82
 
     -- status
     statusLabel = Instance.new("TextLabel")
@@ -1034,7 +1132,8 @@ task.spawn(watchdogLoop)
 task.spawn(statusLoop)
 
 print("===========================================")
-print("🥚 MANZZY EGG HUB loaded!")
+print("🥚 MANZZY EGG HUB v" .. SCRIPT_VERSION .. " loaded!")
+print("   Macro mode: " .. (CONFIG.MacroMode and "ON (input-level, no CFrame writes)" or "OFF (direct API calls)"))
 print("   Anti-AFK: ON | Anti-Kick: " .. (kickProtected and "ON (protected)" or "OFF (executor nggak support)"))
 print("   Atur semuanya lewat GUI di layar.")
 print("   AFK 24/7: taruh script ini di folder AUTO-EXECUTE executor lu.")
