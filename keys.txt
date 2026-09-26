@@ -1,0 +1,5 @@
+# Baris yang diawali # diabaikan.
+# Satu key per baris. Hapus baris untuk mencabut akses (revoke).
+#
+# Owner:
+ManzzyGanteng
